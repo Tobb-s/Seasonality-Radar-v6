@@ -1,0 +1,178 @@
+//@version=6
+indicator("Seasonality Radar — DOW / MOY / HOD + t-score (v6)", overlay=false, max_labels_count=500)
+
+// =============== INPUTS ===============
+grp1 = "Datos y ventana"
+retMode      = input.string("Log-returns", "Métrica de retorno", options=["Log-returns","Simple returns","|ret| (volatilidad)","ret² (volatilidad)"], group=grp1)
+lookbackDays = input.int(365, "Ventana (días calendario)", minval=30, step=30, group=grp1)
+useRTH       = input.bool(false, "Sólo RTH (sesión visible del símbolo)", tooltip="Si tu símbolo define RTH, el gráfico ya recorta fuera de sesión.", group=grp1)
+
+grp2 = "Estacionalidades"
+showDOW = input.bool(true,  "Día de la semana (DOW)", group=grp2)
+showMOY = input.bool(true,  "Mes del año (MOY)",      group=grp2)
+showHOD = input.bool(false, "Hora del día (HOD, intradía)", group=grp2)
+
+grp3 = "Zona horaria (HOD)"
+useCustomTZ = input.bool(false, "Usar zona horaria personalizada (IANA/UTC±hh:mm)", group=grp3, tooltip="Si no, se usa la del exchange.")
+customTZ    = input.string("UTC+0", "Time zone", group=grp3, tooltip="Ej: America/New_York, Europe/Madrid, UTC+0")
+
+grp4 = "Render y señales"
+scaleAsPct = input.bool(true, "Mostrar medias en %", group=grp4)
+tAbsSignal = input.float(2.0, "Umbral |t| para marcar señal", minval=0.0, step=0.1, group=grp4)
+colorBy    = input.string("t-score", "Color de celdas por", options=["t-score","media"], group=grp4)
+digits     = input.int(4, "Decimales", minval=1, maxval=8, group=grp4)
+
+// =============== HELPERS ===============
+inRange = time >= (timenow - lookbackDays * 24 * 60 * 60 * 1000)
+
+float r = na
+if not na(close[1])
+    r := switch retMode
+        "Log-returns"         => math.log(close) - math.log(close[1])
+        "Simple returns"      => close/close[1] - 1.0
+        "|ret| (volatilidad)" => math.abs(math.log(close) - math.log(close[1]))
+        "ret² (volatilidad)"  => math.pow(math.log(close) - math.log(close[1]), 2)
+
+int dowIdx = dayofweek - 1
+int moyIdx = month - 1
+int hodIdx = na
+hodIdx := timeframe.isintraday ? (useCustomTZ ? hour(time, customTZ) : hour) : na
+
+// =============== ARRAYS ACUMULADORES ===============
+var sumsD  = array.new_float(7,  0.0)
+var sums2D = array.new_float(7,  0.0)
+var cntD   = array.new_int(7,    0)
+
+var sumsM  = array.new_float(12, 0.0)
+var sums2M = array.new_float(12, 0.0)
+var cntM   = array.new_int(12,   0)
+
+var sumsH  = array.new_float(24, 0.0)
+var sums2H = array.new_float(24, 0.0)
+var cntH   = array.new_int(24,   0)
+
+if barstate.isfirst
+    for i=0 to 6
+        array.set(sumsD, i, 0), array.set(sums2D, i, 0), array.set(cntD, i, 0)
+    for i=0 to 11
+        array.set(sumsM, i, 0), array.set(sums2M, i, 0), array.set(cntM, i, 0)
+    for i=0 to 23
+        array.set(sumsH, i, 0), array.set(sums2H, i, 0), array.set(cntH, i, 0)
+
+f_add(idx, float x, sums, sums2, cnt) =>
+    if not na(idx) and not na(x)
+        array.set(sums,  idx, array.get(sums, idx)  + x)
+        array.set(sums2, idx, array.get(sums2, idx) + x*x)
+        array.set(cnt,   idx, array.get(cnt, idx)   + 1)
+
+// Filtro de sesión (placeholder simple; para sesiones regulares implementar según necesidad)
+inSession = not useRTH or (time == time)
+
+if inRange and inSession and not na(r)
+    if showDOW
+        f_add(dowIdx, r, sumsD, sums2D, cntD)
+    if showMOY
+        f_add(moyIdx, r, sumsM, sums2M, cntM)
+    if showHOD and timeframe.isintraday
+        f_add(hodIdx, r, sumsH, sums2H, cntH)
+
+f_stats(idx, sums, sums2, cnt) =>
+    float s        = array.get(sums,  idx)
+    float s2       = array.get(sums2, idx)
+    int   n        = array.get(cnt,   idx)
+    float mu       = n > 0 ? s / n : na
+    float variance = n > 1 ? math.max(0.0, (s2 - s*s/n) / (n - 1)) : na
+    float sd       = na(variance) ? na : math.sqrt(variance)
+    float t        = (not na(mu) and not na(sd) and sd > 0 and n > 1) ? (mu / (sd / math.sqrt(n))) : na
+    [mu, sd, t, n]
+
+fmt(x) =>
+    na(x) ? "na" : (scaleAsPct ? str.tostring(x*100, "#." + str.repeat("0", digits)) + "%" : str.tostring(x, "#." + str.repeat("0", digits)))
+
+cellColor(mean, t) =>
+    float key = colorBy == "t-score" ? (na(t) ? 0.0 : t) : (na(mean) ? 0.0 : mean)
+    float mag = math.min(1.0, math.abs(key) / 3.0)
+    int transp = 100 - int(mag * 100)
+    color cpos = color.new(color.teal, transp)
+    color cneg = color.new(color.red,  transp)
+    key >= 0 ? cpos : cneg
+
+var table tD = na
+var table tM = na
+var table tH = na
+
+if barstate.islast
+    int cols = 4
+    if na(tD) and showDOW
+        tD := table.new(position.top_left,  cols, 8,  frame_color=color.new(color.gray,60), frame_width=1, bgcolor=color.new(color.black, 0))
+    if na(tM) and showMOY
+        tM := table.new(position.top_right, cols, 13, frame_color=color.new(color.gray,60), frame_width=1, bgcolor=color.new(color.black, 0))
+    if na(tH) and showHOD and timeframe.isintraday
+        tH := table.new(position.bottom_right, cols, 25, frame_color=color.new(color.gray,60), frame_width=1, bgcolor=color.new(color.black, 0))
+
+    f_header(tab) =>
+        if not na(tab)
+            table.cell(tab, 0, 0, "Bucket", text_color=color.white, bgcolor=color.new(color.gray, 0))
+            table.cell(tab, 1, 0, "Media",  text_color=color.white, bgcolor=color.new(color.gray, 0))
+            table.cell(tab, 2, 0, "t",      text_color=color.white, bgcolor=color.new(color.gray, 0))
+            table.cell(tab, 3, 0, "N",      text_color=color.white, bgcolor=color.new(color.gray, 0))
+    f_header(tD)
+    f_header(tM)
+    f_header(tH)
+
+    var namesD = array.from("Sun","Mon","Tue","Wed","Thu","Fri","Sat")
+    var namesM = array.from("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+
+    if showDOW and not na(tD)
+        for i=0 to 6
+            [mu, sd, t, n] = f_stats(i, sumsD, sums2D, cntD)
+            color bg = cellColor(mu, t)
+            table.cell(tD, 0, i+1, array.get(namesD,i), text_color=color.white)
+            table.cell(tD, 1, i+1, fmt(mu), text_color=color.white, bgcolor=bg)
+            table.cell(tD, 2, i+1, na(t) ? "na" : str.tostring(t, "#.##"), text_color=color.white, bgcolor=bg)
+            table.cell(tD, 3, i+1, str.tostring(n), text_color=color.white)
+
+    if showMOY and not na(tM)
+        for i=0 to 11
+            [mu, sd, t, n] = f_stats(i, sumsM, sums2M, cntM)
+            color bg = cellColor(mu, t)
+            table.cell(tM, 0, i+1, array.get(namesM,i), text_color=color.white)
+            table.cell(tM, 1, i+1, fmt(mu), text_color=color.white, bgcolor=bg)
+            table.cell(tM, 2, i+1, na(t) ? "na" : str.tostring(t, "#.##"), text_color=color.white, bgcolor=bg)
+            table.cell(tM, 3, i+1, str.tostring(n), text_color=color.white)
+
+    if showHOD and timeframe.isintraday and not na(tH)
+        for i=0 to 23
+            [mu, sd, t, n] = f_stats(i, sumsH, sums2H, cntH)
+            color bg = cellColor(mu, t)
+            table.cell(tH, 0, i+1, str.tostring(i, "00") + ":00", text_color=color.white)
+            table.cell(tH, 1, i+1, fmt(mu), text_color=color.white, bgcolor=bg)
+            table.cell(tH, 2, i+1, na(t) ? "na" : str.tostring(t, "#.##"), text_color=color.white, bgcolor=bg)
+            table.cell(tH, 3, i+1, str.tostring(n), text_color=color.white)
+
+    f_t_now(which) =>
+        int i = na
+        float mu = na, sd = na, t = na
+        int n = na
+        if which == "DOW"
+            i := dowIdx
+            [mu, sd, t, n] := f_stats(i, sumsD, sums2D, cntD)
+        if which == "MOY"
+            i := moyIdx
+            [mu, sd, t, n] := f_stats(i, sumsM, sums2M, cntM)
+        if which == "HOD"
+            i := hodIdx
+            [mu, sd, t, n] := f_stats(i, sumsH, sums2H, cntH)
+        [mu, sd, t, n]
+
+    [muD, sdD, tDnow, nD] = showDOW ? f_t_now("DOW") : [na,na,na,na]
+    [muM, sdM, tMnow, nM] = showMOY ? f_t_now("MOY") : [na,na,na,na]
+    [muH, sdH, tHnow, nH] = (showHOD and timeframe.isintraday) ? f_t_now("HOD") : [na,na,na,na]
+
+    bool condStrong = (not na(tDnow) and math.abs(tDnow) >= tAbsSignal) or
+                      (not na(tMnow) and math.abs(tMnow) >= tAbsSignal) or
+                      (not na(tHnow) and math.abs(tHnow) >= tAbsSignal)
+
+    plotshape(condStrong, title="Seasonality strong", style=shape.triangleup, size=size.tiny,
+              location=location.belowbar, color=color.new(color.yellow, 0),
+              text="SEAS", textcolor=color.black)
